@@ -1,0 +1,14 @@
+{
+  "name": "lando-profiler",
+  "version": "1.0.0",
+  "description": "Turns GCP Cloud Logging exports from the Lando landing workers into Firefox Profiler profiles",
+  "main": "index.js",
+  "bin": {
+    "lando-profiler": "./index.js"
+  },
+  "scripts": {
+    "test": "node test.js"
+  },
+  "license": "MPL-2.0",
+  "private": true
+}

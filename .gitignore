@@ -1,0 +1,11 @@
+# Generated profiles.
+lando-profile.json
+*.profile.json
+
+# GCP log exports. These are the tool's input, are large, and can contain
+# anything that was in a commit message or a push, so they stay local.
+*.json
+!package.json
+!package-lock.json
+
+node_modules/
