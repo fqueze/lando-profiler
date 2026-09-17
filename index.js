@@ -978,10 +978,9 @@ const MARKER_SCHEMA = [
     tableLabel: '{marker.data.label}',
     chartLabel: '{marker.data.label}',
     display: ['marker-chart', 'marker-table'],
-    fields: [
-      { key: 'label', label: 'Message', format: 'string' },
-      { key: 'seconds', label: 'Declared wait', format: 'seconds' },
-    ],
+    // The label already reads "try paused, waiting 10s", so the wait is not
+    // repeated as a field of its own.
+    fields: [{ key: 'label', label: 'Message', format: 'string' }],
     // Not obvious from the name why the worker would pause.
     description: 'The worker waiting for a closed tree to reopen.',
   },
@@ -1144,10 +1143,15 @@ function buildProfile(entries, options) {
         revision: contents.revision,
         baseRevision: contents.baseRevision,
         treeherder: contents.treeherder,
-        initialState: thread.stringIndex(job.initialState),
+        // Nearly every job starts as SUBMITTED; only a retry says anything,
+        // so the field is left off when it would just read as the default.
+        initialState:
+          job.initialState && job.initialState !== 'SUBMITTED'
+            ? thread.stringIndex(job.initialState)
+            : undefined,
         commandCount: job.commands.length,
         hgTime,
-        errorCount: job.errors.length,
+        errorCount: job.errors.length || undefined,
         worker: thread.stringIndex(job.host),
         color: TASK_COLORS[state] || 'grey',
       },
@@ -1392,7 +1396,6 @@ function buildProfile(entries, options) {
         {
           type: 'Paused',
           label: note.label,
-          seconds: note.duration / 1000,
         },
         CATEGORY.Debugging
       );

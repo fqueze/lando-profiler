@@ -1077,7 +1077,6 @@ test('a Paused marker lasts as long as the worker said it would', () => {
         paused.push({
           phase: thread.markers.phase[i],
           duration: thread.markers.endTime[i] - thread.markers.startTime[i],
-          seconds: data.seconds,
         });
       }
     }
@@ -1086,7 +1085,6 @@ test('a Paused marker lasts as long as the worker said it would', () => {
   for (const marker of paused) {
     assert.strictEqual(marker.phase, 1, 'should be an interval, not an instant');
     assert.strictEqual(marker.duration, 10000);
-    assert.strictEqual(marker.seconds, 10);
   }
 });
 
@@ -1878,6 +1876,31 @@ test('the variable-length patch list is the last field in the tooltip', () => {
     'patches',
     'the patch list must stay last so the fields above it do not move'
   );
+});
+
+test('fields that would only state the default are left off', () => {
+  // A tooltip row saying "Errors logged: 0" or "Initial state: SUBMITTED" is
+  // noise: it is true of nearly every job and says nothing about this one.
+  const plain = profileFrom([
+    logEntry(0, 'Starting LandingJob 89766 [SUBMITTED]', WORKER),
+    logEntry(10, 'Finished processing LandingJob 89766 [LANDED]', WORKER),
+  ]);
+  const job = findMarker(plain, (d) => d.type === 'Task' && d.jobId);
+  assert.strictEqual(job.initialState, undefined);
+  assert.strictEqual(job.errorCount, undefined);
+
+  // They appear as soon as they carry information.
+  const notable = profileFrom([
+    logEntry(0, 'Starting LandingJob 89767 [DEFERRED]', WORKER),
+    logEntry(10, 'Unexpected error while pushing to try.', {
+      ...WORKER,
+      severity: 'ERROR',
+    }),
+    logEntry(20, 'Finished processing LandingJob 89767 [FAILED]', WORKER),
+  ]);
+  const retried = findMarker(notable, (d) => d.type === 'Task' && d.jobId);
+  assert.strictEqual(resolveString(notable, retried.initialState), 'DEFERRED');
+  assert.strictEqual(retried.errorCount, 1);
 });
 
 // ---------------------------------------------------------------------------
