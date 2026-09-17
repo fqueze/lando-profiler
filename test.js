@@ -19,6 +19,7 @@ const {
   buildProfile,
   hgCommandName,
   commandPhase,
+  describeJobContents,
 } = require('./index.js');
 
 let failures = 0;
@@ -538,6 +539,21 @@ function validateProfile(profile) {
               value >= 0 && value < stringArray.length,
               `${data.type}.${field.key} index ${value} is out of range`
             );
+          }
+          // The front end throws outright on a `list` field that is not an
+          // array, in both the tooltip and the marker table.
+          if (field.format === 'list') {
+            assert.ok(
+              Array.isArray(value),
+              `${data.type}.${field.key} must be an array for the list format`
+            );
+            for (const entry of value) {
+              assert.strictEqual(
+                typeof entry,
+                'string',
+                `${data.type}.${field.key} entries must be strings`
+              );
+            }
           }
         }
         // colorField has to name a field holding a valid GraphColor.
@@ -1534,6 +1550,334 @@ test('hg markers carry the full command line and the remote', () => {
   assert.match(push.cmdLine, /^hg push -r tip/);
   assert.strictEqual(push.remote, 'ssh://hg.mozilla.org/try');
   assert.strictEqual(push.jobId, '89766');
+});
+
+
+// ---------------------------------------------------------------------------
+// What was in the push: author, revisions, patch titles, Treeherder link
+// ---------------------------------------------------------------------------
+
+const PUSH_OUTPUT = [
+  'pushing to ssh://hg.mozilla.org/try',
+  'searching for changes',
+  'remote: adding changesets',
+  'remote: added 2 changesets with 3 changes to 4 files',
+  'remote: ',
+  'remote: View your changes here:',
+  'remote:   https://hg.mozilla.org/try/rev/' + 'a'.repeat(40),
+  'remote:   https://hg.mozilla.org/try/rev/' + 'b'.repeat(40),
+  'remote: ',
+  'remote: Follow the progress of your build on Treeherder:',
+  'remote:   https://treeherder.mozilla.org/jobs?repo=try&revision=' +
+    'b'.repeat(40),
+].join('\n');
+
+/** Builds a profile from raw (un-normalized) synthetic entries. */
+function profileFrom(entries) {
+  const { profile } = buildProfile(normalize(entries), { samples: false });
+  validateProfile(profile);
+  return profile;
+}
+
+/** The first marker payload in any thread matching `predicate`. */
+function findMarker(profile, predicate) {
+  for (const thread of profile.threads) {
+    for (let i = 0; i < thread.markers.length; i++) {
+      const data = thread.markers.data[i];
+      if (data && predicate(data)) {
+        return data;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** A job's worth of commands, as extractHgCommands would return them. */
+function landingCommands({ pushOutput = PUSH_OUTPUT } = {}) {
+  const entries = [
+    running(0, 'c1', `hg update --clean -r ${'0'.repeat(40)}`),
+    output(10, 'c1', '10 files updated, 0 files merged, 0 files removed'),
+    running(20, 'c2', "hg log -r . -T '{node}'"),
+    output(30, 'c2', '0'.repeat(40)),
+    running(40, 'c3', 'hg import -s 95 --no-commit /tmp/one.diff'),
+    output(50, 'c3', 'applying /tmp/one.diff'),
+    running(
+      60,
+      'c4',
+      "hg commit --date '1789015503 0' --user 'Ada Lovelace <ada@example.com>' --logfile /tmp/one.msg"
+    ),
+    output(70, 'c4', 'created new head'),
+    running(80, 'c5', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(90, 'c5', 'Bug 1 - first patch\nTasks automatically selected.'),
+    running(100, 'c6', "hg log -r . -T '{node}'"),
+    output(110, 'c6', 'b'.repeat(40)),
+    running(120, 'c7', 'hg push -r tip ssh://hg.mozilla.org/try -f'),
+    output(130, 'c7', pushOutput),
+  ];
+  return extractHgCommands(normalize(entries));
+}
+
+test('the patch author comes from the hg commit --user flag', () => {
+  const contents = describeJobContents(landingCommands());
+  assert.strictEqual(contents.author, 'Ada Lovelace <ada@example.com>');
+});
+
+test('the commit Lando adds for try syntax is not taken as the author', () => {
+  const entries = [
+    running(
+      0,
+      'c1',
+      "hg commit --date '1 0' --user 'Ada Lovelace <ada@example.com>' --logfile /tmp/a.msg"
+    ),
+    running(
+      10,
+      'c2',
+      "hg commit --date '1 0' --user 'Lando <ada@example.com>' --logfile /tmp/b.msg"
+    ),
+    running(20, 'c3', 'hg purge'),
+  ];
+  const contents = describeJobContents(
+    extractHgCommands(normalize(entries))
+  );
+  assert.strictEqual(contents.author, 'Ada Lovelace <ada@example.com>');
+});
+
+test('a stack with two human authors names both', () => {
+  const entries = [
+    running(
+      0,
+      'c1',
+      "hg commit --date '1 0' --user 'Ada Lovelace <ada@example.com>' --logfile /tmp/a.msg"
+    ),
+    running(
+      10,
+      'c2',
+      "hg commit --date '1 0' --user 'Grace Hopper <grace@example.com>' --logfile /tmp/b.msg"
+    ),
+    running(20, 'c3', 'hg purge'),
+  ];
+  const contents = describeJobContents(
+    extractHgCommands(normalize(entries))
+  );
+  assert.strictEqual(
+    contents.author,
+    'Ada Lovelace <ada@example.com>, Grace Hopper <grace@example.com>'
+  );
+});
+
+test('the base revision is the one the stack was applied on', () => {
+  const contents = describeJobContents(landingCommands());
+  assert.strictEqual(contents.baseRevision, '0'.repeat(40));
+});
+
+test('the pushed revision is the last tip before the push', () => {
+  // Two `hg log -r . -T {node}` calls run, and it is the later one -- the tip
+  // after the patches were committed -- that `hg push -r tip` pushes.
+  const contents = describeJobContents(landingCommands());
+  assert.strictEqual(contents.revision, 'b'.repeat(40));
+});
+
+test('patch titles come from the stack() query, in order', () => {
+  const contents = describeJobContents(landingCommands());
+  assert.deepStrictEqual(contents.patches, [
+    'Bug 1 - first patch',
+    'Tasks automatically selected.',
+  ]);
+});
+
+test('a retried job takes the patch titles of its last attempt', () => {
+  const entries = [
+    running(0, 'c1', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(10, 'c1', 'Bug 1 - stale attempt'),
+    running(20, 'c2', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(30, 'c2', 'Bug 2 - the one that got pushed'),
+    running(40, 'c3', 'hg purge'),
+  ];
+  const contents = describeJobContents(
+    extractHgCommands(normalize(entries))
+  );
+  assert.deepStrictEqual(contents.patches, ['Bug 2 - the one that got pushed']);
+});
+
+test('the Treeherder link is the one the remote printed', () => {
+  const contents = describeJobContents(landingCommands());
+  assert.strictEqual(
+    contents.treeherder,
+    'https://treeherder.mozilla.org/jobs?repo=try&revision=' + 'b'.repeat(40)
+  );
+});
+
+test('a push that printed no Treeherder link gets no link', () => {
+  // A push that failed or timed out never reaches the "Follow the progress"
+  // line, and there is nothing to follow.
+  const contents = describeJobContents(
+    landingCommands({
+      pushOutput: 'pushing to ssh://hg.mozilla.org/try\nsearching for changes',
+    })
+  );
+  assert.strictEqual(contents.treeherder, undefined);
+  // The revision is still known, since it comes from before the push.
+  assert.strictEqual(contents.revision, 'b'.repeat(40));
+});
+
+test('a job with none of these commands reports none of the fields', () => {
+  const contents = describeJobContents([]);
+  assert.deepStrictEqual(contents, {});
+});
+
+test('the landing job marker carries the author, revisions and links', () => {
+  const entries = [
+    logEntry(0, 'Starting LandingJob 89766 [SUBMITTED]', WORKER),
+    ...[
+      running(10, 'c1', `hg update --clean -r ${'0'.repeat(40)}`),
+      output(20, 'c1', '1 files updated'),
+      running(
+        30,
+        'c2',
+        "hg commit --date '1 0' --user 'Ada Lovelace <ada@example.com>' --logfile /tmp/a.msg"
+      ),
+      output(40, 'c2', 'created new head'),
+      running(50, 'c3', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+      output(60, 'c3', 'Bug 1 - first patch'),
+      running(70, 'c4', "hg log -r . -T '{node}'"),
+      output(80, 'c4', 'b'.repeat(40)),
+      running(90, 'c5', 'hg push -r tip ssh://hg.mozilla.org/try -f'),
+      output(100, 'c5', PUSH_OUTPUT),
+    ],
+    logEntry(110, '/files/repos/try/mots.yaml found, setting reviewer data.'),
+    logEntry(120, 'Finished processing LandingJob 89766 [LANDED]', WORKER),
+  ];
+  const profile = profileFrom(entries);
+  const job = findMarker(
+    profile,
+    (d) => d.type === 'Task' && d.jobId === '89766'
+  );
+  assert.ok(job, 'no landing job marker was emitted');
+  assert.strictEqual(
+    resolveString(profile, job.author),
+    'Ada Lovelace <ada@example.com>'
+  );
+  assert.strictEqual(job.revision, 'b'.repeat(40));
+  assert.strictEqual(job.baseRevision, '0'.repeat(40));
+  assert.strictEqual(
+    job.treeherder,
+    'https://treeherder.mozilla.org/jobs?repo=try&revision=' + 'b'.repeat(40)
+  );
+  assert.deepStrictEqual(job.patches, ['Bug 1 - first patch']);
+});
+
+test('a long patch list is capped and says how many it dropped', () => {
+  const titles = Array.from({ length: 20 }, (_, i) => `Bug ${i} - patch ${i}`);
+  const entries = [
+    running(0, 'c1', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(10, 'c1', titles.join('\n')),
+    running(20, 'c2', 'hg purge'),
+  ];
+  const contents = describeJobContents(
+    extractHgCommands(normalize(entries))
+  );
+  assert.strictEqual(contents.patches.length, 20);
+
+  // The marker field, not the raw list, is what gets capped.
+  const jobEntries = [
+    logEntry(0, 'Starting LandingJob 4242 [SUBMITTED]', WORKER),
+    running(10, 'c1', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(20, 'c1', titles.join('\n')),
+    logEntry(30, 'Finished processing LandingJob 4242 [LANDED]', WORKER),
+  ];
+  const profile = profileFrom(jobEntries);
+  const job = findMarker(
+    profile,
+    (d) => d.type === 'Task' && d.jobId === '4242'
+  );
+  // The `list` format takes an array, which the tooltip renders as a <ul>.
+  assert.ok(Array.isArray(job.patches));
+  assert.strictEqual(job.patches.length, 13, 'expected 12 patches plus a summary');
+  assert.strictEqual(job.patches[0], 'Bug 0 - patch 0');
+  assert.strictEqual(job.patches[11], 'Bug 11 - patch 11');
+  assert.strictEqual(job.patches[12], '… and 8 more');
+});
+
+test('a job cut off by the end of the log keeps the work the log does show', () => {
+  // The export ends mid-job, so there is no "Finished processing" line. Ending
+  // the job at its start would make a zero-length interval that no command
+  // falls inside, and the work would vanish from the profile.
+  const entries = [
+    logEntry(0, 'Starting LandingJob 90371 [SUBMITTED]', WORKER),
+    running(1000, 'c1', `hg update --clean -r ${'0'.repeat(40)}`),
+    output(2000, 'c1', '29 files updated'),
+    running(
+      3000,
+      'c2',
+      "hg commit --date '1 0' --user 'Ada Lovelace <ada@example.com>' --logfile /tmp/a.msg"
+    ),
+    output(4000, 'c2', 'created new head'),
+    running(5000, 'c3', "hg log -r 'stack()' -T '{desc|firstline}\\n'"),
+    output(6000, 'c3', 'WIP - a patch that never landed'),
+    // No push, and no "Finished processing" line: the window ends here.
+  ];
+  const normalized = normalize(entries);
+  const { jobs } = extractActivities(normalized);
+  assert.strictEqual(jobs.length, 1);
+  assert.strictEqual(jobs[0].state, 'UNTERMINATED');
+  // Bounded by the last line from that worker, not collapsed to its start.
+  assert.strictEqual(jobs[0].end, jobs[0].start + 6000);
+
+  const commands = extractHgCommands(normalized);
+  attributeCommands(commands, jobs, []);
+  assert.strictEqual(
+    jobs[0].commands.length,
+    3,
+    'the commands the log does show must be attributed to the job'
+  );
+
+  const profile = profileFrom(entries);
+  const job = findMarker(
+    profile,
+    (d) => d.type === 'Task' && d.jobId === '90371'
+  );
+  assert.ok(job);
+  assert.strictEqual(job.commandCount, 3);
+  // The metadata is still recoverable, even without the push.
+  assert.strictEqual(
+    resolveString(profile, job.author),
+    'Ada Lovelace <ada@example.com>'
+  );
+  assert.strictEqual(job.baseRevision, '0'.repeat(40));
+  // But there is no Treeherder link, because the push never happened.
+  assert.strictEqual(job.treeherder, undefined);
+});
+
+test('an unfinished maintenance round is bounded the same way', () => {
+  const entries = [
+    logEntry(0, "Starting idle maintenance for 1 repo(s): ['try']", WORKER),
+    running(1000, 'c1', "hg strip --no-backup -r 'not public()'"),
+    output(2000, 'c1', 'saved backup bundle'),
+  ];
+  const normalized = normalize(entries);
+  const { maintenance } = extractActivities(normalized);
+  assert.strictEqual(maintenance.length, 1);
+  assert.strictEqual(maintenance[0].end, maintenance[0].start + 2000);
+
+  attributeCommands(extractHgCommands(normalized), [], maintenance);
+  assert.strictEqual(maintenance[0].commands.length, 1);
+});
+
+test('the variable-length patch list is the last field in the tooltip', () => {
+  // The tooltip renders a schema's fields in order, and this one is anywhere
+  // from 1 to 44 entries long. Any field after it would shift down as the
+  // mouse moves between landings of different stack sizes.
+  const profile = profileFrom([
+    logEntry(0, 'Starting LandingJob 89766 [SUBMITTED]', WORKER),
+    logEntry(10, 'Finished processing LandingJob 89766 [LANDED]', WORKER),
+  ]);
+  const schema = profile.meta.markerSchema.find((s) => s.name === 'Task');
+  const visible = schema.fields.filter((f) => !f.hidden);
+  assert.strictEqual(
+    visible[visible.length - 1].key,
+    'patches',
+    'the patch list must stay last so the fields above it do not move'
+  );
 });
 
 // ---------------------------------------------------------------------------

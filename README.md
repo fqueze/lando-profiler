@@ -65,6 +65,10 @@ that are silent by design (`commit`, `purge`, `revert`, `export`); anything that
 talks to a remote prints its output and so is timed exactly. The run summary
 reports how many commands fell back to inference.
 
+The same applies to the job the export ends in the middle of: with no "Finished
+processing" line it ends at the last line its worker logged, and is marked
+`UNTERMINATED`.
+
 ## What it produces
 
 **Tracks.** One track per worker pod, and nothing finer.
@@ -95,6 +99,23 @@ hg       push
 A landing's marker is labelled with its job id, and carries a `Details` link to
 its page in the Lando web UI (`https://lando.moz.tools/landings/<id>/`;
 override the origin with `$LANDO_ORIGIN`).
+
+It also says what was actually pushed. None of this is logged as such, but the
+hg commands and their output carry all of it:
+
+| Field | Where it comes from |
+| --- | --- |
+| `Author` | the `--user` of the `hg commit` calls |
+| `Patches` | the output of `hg log -r 'stack()' -T '{desc|firstline}'`, one line per patch |
+| `Base revision` | the `-r` of `hg update --clean` |
+| `Pushed revision` | the last `hg log -r . -T '{node}'` before the push, which is the `tip` that `hg push -r tip` sends |
+| `Treeherder` | the "Follow the progress of your build" URL that hg.mozilla.org prints in the push output |
+
+So the marker table is searchable by author, by bug number and by patch title.
+
+A push that failed never printed a Treeherder URL, and those landings have no
+link. The last entry in `Patches` is the try-syntax commit
+(`Tasks automatically selected.`, `Fuzzy query=...`) rather than a bug title.
 
 Colour on a `Task` means "this is how it ended", and only tasks that ended carry
 one, through `colorField`: green for `LANDED`, red for `FAILED`, orange for

@@ -288,9 +288,13 @@ function extractActivities(entries) {
 
   const openJobs = new Map();
   const openMaintByHost = new Map();
+  // The last line seen from each worker, which is as far as an activity still
+  // open when the log window ended can be said to have run.
+  const lastTimeByHost = new Map();
 
   for (const entry of entries) {
     const { message, time, host } = entry;
+    lastTimeByHost.set(host, time);
 
     let match = RE_JOB_START.exec(message);
     if (match) {
@@ -436,15 +440,22 @@ function extractActivities(entries) {
     }
   }
 
+  // Whatever is still open when the export ends ran at least until the last
+  // line from its worker. Ending it at its start instead would leave a
+  // zero-length interval, which no command falls inside, so the work the log
+  // does show would be attributed to nothing and disappear from the profile.
   for (const job of openJobs.values()) {
     if (job.end === null) {
-      job.end = job.start;
+      job.end = Math.max(job.start, lastTimeByHost.get(job.host) ?? job.start);
       job.state = 'UNTERMINATED';
     }
   }
   for (const round of openMaintByHost.values()) {
     if (round.end === null) {
-      round.end = round.start;
+      round.end = Math.max(
+        round.start,
+        lastTimeByHost.get(round.host) ?? round.start
+      );
     }
   }
 
@@ -606,6 +617,132 @@ const PATCH_COMMAND = {
   'Export patches': 'hg export',
 };
 
+// ---------------------------------------------------------------------------
+// What was in the push? Author, revisions and patch titles.
+// ---------------------------------------------------------------------------
+
+/**
+ * A commit authored as `Lando <the-pusher's-address>` rather than under the
+ * pusher's own name. It is the machinery's name, not a person's, so it does not
+ * count towards a landing's author.
+ *
+ * This is the try-syntax commit carrying the `try_task_config.json`, which is
+ * usually authored by the person pushing -- 750 of them against 14 attributed
+ * to Lando in a 24h export -- so this only matters for that handful.
+ */
+const LANDO_AUTHOR = /^Lando </;
+
+/**
+ * Pulls the contents of a landing out of the hg commands it ran. None of this
+ * is logged directly, but the command lines and their output carry all of it:
+ *
+ * - `hg commit --user '<author>'` gives the patch author, once per patch.
+ * - `hg update --clean -r <rev>` gives the revision the stack was applied on.
+ * - `hg log -r . -T '{node}'` prints the current tip; the last one before the
+ *   push is what `hg push -r tip` went on to push, which is the revision to
+ *   look up on Treeherder.
+ * - `hg log -r 'stack()' -T '{desc|firstline}'` prints one line per patch, in
+ *   order, which is the closest thing to a patch title the log has.
+ *
+ * Returns only the fields it could establish; a job cut off by the log window
+ * legitimately has none of them.
+ */
+function describeJobContents(commands) {
+  const result = {};
+  const authors = [];
+  let titles = null;
+
+  for (const command of commands) {
+    const line = command.command;
+
+    const user = /--user '([^']+)'/.exec(line);
+    if (user) {
+      authors.push(user[1]);
+    }
+
+    const base = /^hg update --clean -r ([0-9a-f]{12,40})/.exec(line);
+    if (base) {
+      result.baseRevision = base[1];
+    }
+
+    // Reassigned on every occurrence, so the last one before the push wins.
+    // That is the tip that `hg push -r tip` pushes.
+    if (/^hg log -r \. -T '\{node\}'/.test(line) && command.output) {
+      const node = /^[0-9a-f]{12,40}$/.exec(command.output.trim());
+      if (node) {
+        result.revision = node[0];
+      }
+    }
+
+    if (/^hg push /.test(line) && command.output) {
+      // hg.mozilla.org prints where to follow the push, so the link is the one
+      // the server gave rather than one assembled here. A push that failed --
+      // the remote rejected it, or it timed out holding the lock -- prints no
+      // such line, which is the right answer: there is nothing to follow.
+      const url = RE_TREEHERDER.exec(command.output);
+      if (url) {
+        result.treeherder = url[0];
+      }
+    }
+
+    // A job that had to retry runs this twice; the last run describes the
+    // stack that was actually pushed.
+    if (/^hg log -r 'stack\(\)'/.test(line) && command.output) {
+      const lines = command.output
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length) {
+        titles = lines;
+      }
+    }
+
+  }
+
+  // The author is the person whose patches these are, so the Lando commit does
+  // not count. Stacks from more than one author exist but are rare enough to
+  // be worth naming rather than picking a winner.
+  const human = [...new Set(authors.filter((a) => !LANDO_AUTHOR.test(a)))];
+  if (human.length === 1) {
+    result.author = human[0];
+  } else if (human.length > 1) {
+    result.author = human.join(', ');
+  }
+
+  if (titles) {
+    result.patches = titles;
+  }
+
+  return result;
+}
+
+/**
+ * A successful `hg push` ends with the URL hg.mozilla.org prints for following
+ * the resulting builds.
+ */
+const RE_TREEHERDER = /https:\/\/treeherder\.mozilla\.org\/jobs\?\S+/;
+
+/**
+ * The patch titles, for the `list` marker format: the tooltip renders an array
+ * as a real bulleted list, and the marker table joins it with commas.
+ *
+ * A stack is usually two or three patches, but the tail is long -- the largest
+ * in a 24h export was 44 -- so the list is capped and says how many it left
+ * out rather than filling the tooltip.
+ */
+const PATCH_LIST_MAX = 12;
+
+function formatPatchList(titles) {
+  if (!titles || !titles.length) {
+    return undefined;
+  }
+  const shown = titles.slice(0, PATCH_LIST_MAX).map((t) => truncate(t, 160));
+  if (titles.length > shown.length) {
+    shown.push(`… and ${titles.length - shown.length} more`);
+  }
+  return shown;
+}
+
 /**
  * The category a *stack frame* is drawn in, by pipeline stage. Frames drive the
  * timeline's activity graph and the call tree, which want a colour per stage.
@@ -739,7 +876,11 @@ const MARKER_SCHEMA = [
     fields: [
       { key: 'name', label: 'Task', format: 'unique-string' },
       { key: 'state', label: 'Outcome', format: 'unique-string' },
+      { key: 'author', label: 'Author', format: 'unique-string' },
       { key: 'url', label: 'Details', format: 'url' },
+      { key: 'treeherder', label: 'Treeherder', format: 'url' },
+      { key: 'revision', label: 'Pushed revision', format: 'string' },
+      { key: 'baseRevision', label: 'Base revision', format: 'string' },
       { key: 'jobId', label: 'Job ID', format: 'string' },
       { key: 'repo', label: 'Repo', format: 'unique-string' },
       { key: 'initialState', label: 'Initial state', format: 'unique-string' },
@@ -755,6 +896,10 @@ const MARKER_SCHEMA = [
       { key: 'patchCount', label: 'Patches', format: 'integer' },
       // Read for the marker's colour, not for display.
       { key: 'color', label: 'Colour', format: 'string', hidden: true },
+      // Last on purpose. The tooltip renders the fields in schema order, and
+      // this one is a list of anywhere from 1 to 44 patches, so anything below
+      // it would jump around as the mouse moves between landings.
+      { key: 'patches', label: 'Patches', format: 'list' },
     ],
   },
   {
@@ -979,6 +1124,8 @@ function buildProfile(entries, options) {
       0
     );
     const state = job.state || 'UNKNOWN';
+    const contents = describeJobContents(job.commands);
+    const patchList = formatPatchList(contents.patches);
     thread.addMarker(
       'Task',
       rel(job.start),
@@ -992,6 +1139,11 @@ function buildProfile(entries, options) {
         jobId: job.id,
         repo: job.repo ? thread.stringIndex(job.repo) : undefined,
         state: thread.stringIndex(state),
+        author: contents.author ? thread.stringIndex(contents.author) : undefined,
+        patches: patchList,
+        revision: contents.revision,
+        baseRevision: contents.baseRevision,
+        treeherder: contents.treeherder,
         initialState: thread.stringIndex(job.initialState),
         commandCount: job.commands.length,
         hgTime,
@@ -1667,4 +1819,5 @@ module.exports = {
   buildProfile,
   hgCommandName,
   commandPhase,
+  describeJobContents,
 };
